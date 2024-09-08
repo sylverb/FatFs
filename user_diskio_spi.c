@@ -36,8 +36,8 @@ extern SPI_HandleTypeDef SD_SPI_HANDLE;
 /* Function prototypes */
 
 //(Note that the _256 is used as a mask to clear the prescalar bits as it provides binary 111 in the correct position)
-#define FCLK_SLOW() { MODIFY_REG(SD_SPI_HANDLE.Instance->CR1, SPI_BAUDRATEPRESCALER_256, SPI_BAUDRATEPRESCALER_128); }	/* Set SCLK = slow, approx 280 KBits/s*/
-#define FCLK_FAST() { MODIFY_REG(SD_SPI_HANDLE.Instance->CR1, SPI_BAUDRATEPRESCALER_256, SPI_BAUDRATEPRESCALER_8); }	/* Set SCLK = fast, approx 4.5 MBits/s */
+#define FCLK_SLOW() { MODIFY_REG(SD_SPI_HANDLE.Instance->CR1, SPI_BAUDRATEPRESCALER_256, SPI_BAUDRATEPRESCALER_128); }	/* Set SCLK = slow*/
+#define FCLK_FAST() { MODIFY_REG(SD_SPI_HANDLE.Instance->CR1, SPI_BAUDRATEPRESCALER_256, SPI_BAUDRATEPRESCALER_8); }	/* Set SCLK = fast*/
 
 #define CS_HIGH()	{HAL_GPIO_WritePin(SD_CS_GPIO_Port, SD_CS_Pin, GPIO_PIN_SET);}
 #define CS_LOW()	{HAL_GPIO_WritePin(SD_CS_GPIO_Port, SD_CS_Pin, GPIO_PIN_RESET);}
@@ -107,8 +107,9 @@ BYTE xchg_spi (
 )
 {
 	BYTE rxDat;
-    HAL_SPI_TransmitReceive(&SD_SPI_HANDLE, &dat, &rxDat, 1, 50);
-    return rxDat;
+	wdog_refresh();
+	HAL_SPI_TransmitReceive(&SD_SPI_HANDLE, &dat, &rxDat, 1, 50);
+	return rxDat;
 }
 
 
@@ -155,7 +156,7 @@ int wait_ready (	/* 1:Ready, 0:Timeout */
 	waitSpiTimerTickDelay = (uint32_t)wt;
 	do {
 		d = xchg_spi(0xFF);
-		/* This loop takes a time. Insert rot_rdq() here for multitask envilonment. */
+		/* This loop takes a time. Insert rot_rdq() here for multitask environment. */
 	} while (d != 0xFF && ((HAL_GetTick() - waitSpiTimerTickStart) < waitSpiTimerTickDelay));	/* Wait for card goes ready or timeout */
 
 	return (d == 0xFF) ? 1 : 0;
@@ -164,7 +165,7 @@ int wait_ready (	/* 1:Ready, 0:Timeout */
 
 
 /*-----------------------------------------------------------------------*/
-/* Despiselect card and release SPI                                         */
+/* Despiselect card and release SPI                                      */
 /*-----------------------------------------------------------------------*/
 
 static
@@ -248,6 +249,33 @@ int xmit_datablock (	/* 1:OK, 0:Failed */
 	return 1;
 }
 
+/*-----------------------------------------------------------------------*/
+/* Send a CMD0 to the MMC                                                */
+/*-----------------------------------------------------------------------*/
+
+static
+BYTE send_cmd0 ()
+{
+	BYTE n, res;
+    BYTE dummy = 0xFF;
+
+    uint8_t cmd0[] = {0x40, 0x00, 0x00, 0x00, 0x00, 0x95}; // CMD0 + CRC;
+
+    HAL_GPIO_WritePin(SD_CS_GPIO_Port, SD_CS_Pin, GPIO_PIN_RESET); // Select SD
+
+    // Transmit CMD0
+    HAL_SPI_Transmit(&SD_SPI_HANDLE, cmd0, sizeof(cmd0), HAL_MAX_DELAY);
+
+	n = 10;								/* Wait for response (10 bytes max) */
+	do {
+        HAL_SPI_TransmitReceive(&hspi1, &dummy, &res, 1, HAL_MAX_DELAY);
+        n--;
+    } while ((res == 0xFF) && n > 0);
+
+    HAL_GPIO_WritePin(SD_CS_GPIO_Port, SD_CS_Pin, GPIO_PIN_SET); // Deselect SD
+
+	return res;							/* Return received response */
+}
 
 /*-----------------------------------------------------------------------*/
 /* Send a command packet to the MMC                                      */
@@ -322,13 +350,13 @@ inline DSTATUS USER_SPI_initialize (
 	if (drv != 0) return STA_NOINIT;		/* Supports only drive 0 */
 	//assume SPI already init init_spi();	/* Initialize SPI */
 
-	if (Stat & STA_NODISK) return Stat;	/* Is card existing in the soket? */
+	if (Stat & STA_NODISK) return Stat;	/* Is card existing in the socket? */
 
 	FCLK_SLOW();
 	for (n = 10; n; n--) xchg_spi(0xFF);	/* Send 80 dummy clocks */
 
 	ty = 0;
-	if (send_cmd(CMD0, 0) == 1) {			/* Put the card SPI/Idle state */
+	if (send_cmd0() == 1) {			/* Put the card SPI/Idle state */
 		SPI_Timer_On(1000);					/* Initialization timeout = 1 sec */
 		if (send_cmd(CMD8, 0x1AA) == 1) {	/* SDv2? */
 			for (n = 0; n < 4; n++) ocr[n] = xchg_spi(0xFF);	/* Get 32 bit return value of R7 resp */
