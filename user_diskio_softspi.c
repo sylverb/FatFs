@@ -321,7 +321,7 @@ static void SD_PowerOn(void)
     response = send_cmd(GO_IDLE_STATE, 0);
     if (response.r0 != (1 << R1_IDLE)) {
         printf("SD: Go idle state failed\n");
-    switch_ospi_gpio(true);
+        switch_ospi_gpio(true);
         abort();
     }
 
@@ -506,31 +506,6 @@ inline DRESULT USER_SPI_read(
     }
     else
     {
-        do
-        {
-            if (send_cmd(READ_SINGLE_BLOCK, sector).r0) {
-                printf("SD: Failed to send read cmd\n");
-                abort();
-            }
-
-            // We would fail on watchdog if something is wrong here
-            do {
-                SoftSpi_WriteDummyRead(sd.spi, &ret, 1);
-            } while(ret != START_BLOCK_TOKEN);
-
-            SoftSpi_WriteDummyRead(sd.spi, buff, BLOCK_SIZE);
-
-            finish_read_cmd();
-            buff += BLOCK_SIZE;
-            if (!(CardType & CT_BLOCK)) {
-                sector += 512;
-            } else {
-                sector++;
-            }
-
-        } while (--count);
-
-#if 0
         if (send_cmd(READ_MULTIPLE_BLOCK, sector).r0) {
             printf("SD: Failed to send read cmd\n");
             abort();
@@ -543,13 +518,13 @@ inline DRESULT USER_SPI_read(
         do
         {
             SoftSpi_WriteDummyRead(sd.spi, buff, BLOCK_SIZE);
-            finish_read_cmd();
+            /* discard CRC */
+            SoftSpi_WriteDummyRead(sd.spi, NULL, 10);
             buff += 512;
         } while (--count);
 
         /* STOP_TRANSMISSION */
         send_cmd(SEND_STOP_TRANSMISSION, 0);
-#endif
     }
 
     /* Idle */
@@ -596,7 +571,7 @@ inline DRESULT USER_SPI_write(
 
     if (count == 1)
     {
-        /* READ_SINGLE_BLOCK */
+        /* WRITE_SINGLE_BLOCK */
         do {
             response = send_cmd(WRITE_SINGLE_BLOCK, sector);
         } while (response.r0);
@@ -613,7 +588,28 @@ inline DRESULT USER_SPI_write(
     }
     else
     {
-        printf("USER_SPI_write count = %d\n",count); while(1);
+        do
+        {
+            do {
+                response = send_cmd(WRITE_SINGLE_BLOCK, sector);
+            } while (response.r0);
+
+            // Send dummy pre-send byte and start block token
+            SoftSpi_WriteDummyRead(sd.spi, NULL, 1);
+            SoftSpi_WriteRead(sd.spi, &start_block_token, NULL, 1);
+
+            SoftSpi_WriteRead(sd.spi, buff, NULL, BLOCK_SIZE);
+
+            finish_write_cmd();
+
+            buff += BLOCK_SIZE;
+            if (!(CardType & CT_BLOCK)) {
+                sector += 512;
+            } else {
+                sector++;
+            }
+
+        } while (--count);
     }
 
     /* Idle */
