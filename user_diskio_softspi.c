@@ -323,7 +323,7 @@ static bool SD_PowerOn(void)
 
     DESELECT();
     PowerFlag = 1;
-    return true; // Sylver
+    return true;
 }
 
 /* power off */
