@@ -33,6 +33,15 @@
 
 static volatile DSTATUS Stat = STA_NOINIT; /* Disk Status */
 static uint8_t CardType;                   /* Type 0:MMC, 1:SDC, 2:Block addressing */
+
+/* Multi-block (CMD18) read capability, probed ONCE on first multi-sector read:
+ *  -1 = not yet probed, 0 = card/wiring fails CMD18 (use single-block), 1 = CMD18 OK.
+ * CMD18 streams N sectors after ONE command (vs one CMD17 + response per sector), so it
+ * cuts the per-sector command overhead — the real SD-throughput win for video frames and
+ * MP3 data at the SAME (reliable) bit clock. No per-read fallback cost: the decision is
+ * made once. Cards that don't like CMD18 (the old #if 0'd code's "some people") just keep
+ * the single-block path — zero regression. */
+static int sd_multiblock = -1;
 static uint8_t PowerFlag = 0;              /* Power flag */
 
 #ifndef MIN
@@ -188,6 +197,7 @@ struct response
 #define SD_STOP_TRANSMISSION_CMD 12
 #define SD_READ_SINGLE_BLOCK_CMD 17
 #define SD_READ_MULTIPLE_BLOCK_CMD 18
+#define SD_SET_BLOCK_COUNT_CMD 23
 #define SD_WRITE_SINGLE_BLOCK_CMD 24
 #define SD_WRITE_MULTIPLE_BLOCK_CMD 25
 #define SD_SEND_OP_COND_ACMD 41
@@ -202,6 +212,7 @@ enum cmd_list
     SEND_STOP_TRANSMISSION,
     READ_SINGLE_BLOCK,
     READ_MULTIPLE_BLOCK,
+    SET_BLOCK_COUNT,
     WRITE_SINGLE_BLOCK,
     WRITE_MULTIPLE_BLOCK,
     SEND_OP_COND_ACMD,
@@ -221,6 +232,7 @@ static struct sd_cmd
     [SEND_STOP_TRANSMISSION] = {SD_STOP_TRANSMISSION_CMD, 0x00, responseCMD12},
     [READ_SINGLE_BLOCK] = {SD_READ_SINGLE_BLOCK_CMD, 0x0, responseR1},
     [READ_MULTIPLE_BLOCK] = {SD_READ_MULTIPLE_BLOCK_CMD, 0x0, responseR1},
+    [SET_BLOCK_COUNT] = {SD_SET_BLOCK_COUNT_CMD, 0x0, responseR1},
     [WRITE_SINGLE_BLOCK] = {SD_WRITE_SINGLE_BLOCK_CMD, 0x0, responseR1},
     [WRITE_MULTIPLE_BLOCK] = {SD_WRITE_MULTIPLE_BLOCK_CMD, 0x0, responseR1},
     [SEND_OP_COND_ACMD] = {SD_SEND_OP_COND_ACMD, 0x0, responseR1},
@@ -254,6 +266,15 @@ static struct response send_cmd(enum cmd_list cmd, uint32_t arg)
     }
 
     return response;
+}
+
+/* ACMD23: pre-declare block count before CMD18/CMD25 (SD cards only). */
+static void acmd23(UINT count)
+{
+    if (CardType & CT_SDC) {
+        send_cmd(APP_CMD, 0);
+        send_cmd(SET_BLOCK_COUNT, count);
+    }
 }
 
 static void finish_read_cmd(void)
@@ -461,6 +482,67 @@ DSTATUS USER_SOFTSPI_status(
 }
 
 /*-----------------------------------------------------------------------*/
+/* Wait (bounded) for the 0xFE data-start token; return true if it arrived. */
+static bool wait_start_token(void)
+{
+    uint8_t ret = 0xFF;
+    for (int g = 0; g < 200000; g++) {
+        SoftSpi_WriteDummyRead(sd.spi, &ret, 1);
+        if (ret == START_BLOCK_TOKEN)
+            return true;
+    }
+    return false;
+}
+
+/* Probe CMD18 ONCE, self-contained (own select/deselect). Reads sector 0 both ways and
+ * compares: only accept multi-block if it returns byte-identical data to the single-block
+ * read — so a card that ACKs CMD18 but streams wrong bytes is rejected, not trusted. */
+static int probe_multiblock(void)
+{
+    /* Stack only — static 1536B here broke DTCM padding before ._user_stack on docker release. */
+    uint8_t ref[512];
+    uint8_t mb[1024];
+    int ok = 0;
+
+    switch_ospi_gpio(false);
+    SELECT();
+
+    /* reference: single-block read of sector 0 (address 0 works for byte- and block-addr) */
+    if (send_cmd(READ_SINGLE_BLOCK, 0).r0 == 0 && wait_start_token()) {
+        SoftSpi_WriteDummyRead(sd.spi, ref, 512);
+        finish_read_cmd();
+
+        /* candidate: multi-block read of sectors 0..1 */
+        if (send_cmd(READ_MULTIPLE_BLOCK, 0).r0 == 0) {
+            int good = 1;
+            for (int b = 0; b < 2; b++) {
+                if (!wait_start_token()) {
+                    good = 0;
+                    break;
+                }
+                SoftSpi_WriteDummyRead(sd.spi, mb + b * 512, 512);
+                finish_read_cmd();
+            }
+            send_cmd(SEND_STOP_TRANSMISSION, 0); /* CMD12 — end the stream */
+            if (good) {
+                ok = 1;
+                for (int i = 0; i < 512; i++) {
+                    if (ref[i] != mb[i]) {
+                        ok = 0;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    DESELECT();
+    SD_ReadyWait();
+    switch_ospi_gpio(true);
+    return ok;
+}
+
+/*-----------------------------------------------------------------------*/
 /* Read sector(s)                                                        */
 /*-----------------------------------------------------------------------*/
 
@@ -479,6 +561,10 @@ DRESULT USER_SOFTSPI_read(
     /* no disk */
     if (Stat & STA_NOINIT)
         return RES_NOTRDY;
+
+    /* Probe CMD18 once, before any address conversion or select (self-contained). */
+    if (count > 1 && sd_multiblock < 0)
+        sd_multiblock = probe_multiblock();
 
     /* convert to byte address */
     if (!(CardType & CT_BLOCK))
@@ -506,6 +592,28 @@ DRESULT USER_SOFTSPI_read(
 
         finish_read_cmd();
         count = 0;
+    }
+    else if (sd_multiblock == 1)
+    {
+        /* READ_MULTIPLE_BLOCK (CMD18): one command, then the card streams every sector
+         * back-to-back, each with its OWN 0xFE start token + 512 data + 2 CRC bytes; a
+         * single CMD12 ends the stream. (The old #if 0'd version was buggy — it waited for
+         * the token only once and discarded 10 CRC bytes instead of 2 — which is why it
+         * "didn't work"; probe_multiblock() gates this on a verified read.) */
+        acmd23(count);
+        if (send_cmd(READ_MULTIPLE_BLOCK, sector).r0 == 0)
+        {
+            while (count)
+            {
+                if (!wait_start_token())
+                    break; /* leaves count>0 -> RES_ERROR below */
+                SoftSpi_WriteDummyRead(sd.spi, buff, BLOCK_SIZE);
+                finish_read_cmd(); /* 2 CRC bytes */
+                buff += BLOCK_SIZE;
+                count--;
+            }
+        }
+        send_cmd(SEND_STOP_TRANSMISSION, 0); /* CMD12 — always, to end the stream */
     }
     else
     {
@@ -538,29 +646,6 @@ DRESULT USER_SOFTSPI_read(
             }
 
         } while (--count);
-
-#if 0 // For an unknown reason, this code is not working for some people, so we use the previous code instead
-        if (send_cmd(READ_MULTIPLE_BLOCK, sector).r0)
-        {
-            return RES_ERROR;
-        }
-        // We would fail on watchdog if something is wrong here
-        do
-        {
-            SoftSpi_WriteDummyRead(sd.spi, &ret, 1);
-        } while (ret != START_BLOCK_TOKEN);
-
-        do
-        {
-            SoftSpi_WriteDummyRead(sd.spi, buff, BLOCK_SIZE);
-            /* discard CRC */
-            SoftSpi_WriteDummyRead(sd.spi, NULL, 10);
-            buff += 512;
-        } while (--count);
-
-        /* STOP_TRANSMISSION */
-        send_cmd(SEND_STOP_TRANSMISSION, 0);
-#endif
     }
 
     /* Idle */

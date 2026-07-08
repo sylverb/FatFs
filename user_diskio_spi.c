@@ -28,12 +28,15 @@
 #include "stm32h7xx_hal.h" /* Provide the low-level HAL functions */
 #include "user_diskio_spi.h"
 #include "gw_timer.h"
+#include <string.h>
 
 #define SD_SPI_HANDLE hspi1
 
 static volatile DSTATUS Stat = STA_NOINIT; /* Disk Status */
 static uint8_t CardType;                   /* Type 0:MMC, 1:SDC, 2:Block addressing */
 static uint8_t PowerFlag = 0;              /* Power flag */
+/* CMD18 capability probed once at init: -1=unprobed, 0=single-block only, 1=OK */
+static int sd_multiblock = -1;
 
 #define FCLK_SLOW()                                                       \
     {                                                                     \
@@ -76,6 +79,17 @@ static void SPI_TxBuffer(const uint8_t *buffer, uint16_t len)
     while (!__HAL_SPI_GET_FLAG(HSPI_SDCARD, SPI_FLAG_TXE))
         ;
     HAL_SPI_Transmit(HSPI_SDCARD, (uint8_t *)buffer, len, SPI_TIMEOUT);
+}
+
+/* SPI receive buffer (bulk). SD data blocks are always 512 bytes; reading
+   byte-by-byte via SPI_RxByte() was ~10x slower than necessary. */
+static void SPI_RxBuffer(uint8_t *buffer, uint16_t len)
+{
+    uint8_t tx_ff[512];
+    memset(tx_ff, 0xFF, len);
+    while (!__HAL_SPI_GET_FLAG(HSPI_SDCARD, SPI_FLAG_TXE))
+        ;
+    HAL_SPI_TransmitReceive(HSPI_SDCARD, tx_ff, buffer, len, SPI_TIMEOUT);
 }
 
 /* SPI receive a byte */
@@ -168,8 +182,7 @@ static bool SD_RxDataBlock(BYTE *buff, UINT len)
     if (token != 0xFE)
         return false;
 
-    for (UINT i = 0; i < len; i++)
-        buff[i] = SPI_RxByte();
+    SPI_RxBuffer(buff, len);
 
     SPI_RxByte(); // discard CRC MSB
     SPI_RxByte(); // discard CRC LSB
@@ -249,6 +262,71 @@ static BYTE SD_SendCmd(BYTE cmd, uint32_t arg)
     return res;
 }
 
+/* Deselect + bus idle clock (caller may already be selected). */
+static void read_deselect(void)
+{
+    DESELECT();
+    SPI_RxByte();
+}
+
+/* One sector via CMD17; addr is byte- or block-address per CardType. */
+static bool read_sector_cmd17(DWORD addr, BYTE *buff)
+{
+    return (SD_SendCmd(CMD17, addr) == 0) && SD_RxDataBlock(buff, 512);
+}
+
+/* CMD17 loop: advance addr/buff pointers, decrement count. Caller holds SELECT. */
+static bool read_sectors_cmd17(DWORD *paddr, BYTE **pbuff, UINT *pcount)
+{
+    while (*pcount) {
+        if (!read_sector_cmd17(*paddr, *pbuff))
+            return false;
+        if (!(CardType & CT_BLOCK))
+            *paddr += 512;
+        else
+            (*paddr)++;
+        *pbuff += 512;
+        (*pcount)--;
+    }
+    return true;
+}
+
+/* Probe CMD18 once at init: sector 0 must match CMD17 reference (self-contained
+ * select/deselect). */
+static int probe_multiblock(void)
+{
+    uint8_t ref[512];
+    uint8_t mb[1024];
+    int ok = 0;
+    const DWORD addr = 0;
+
+    SELECT();
+    if (read_sector_cmd17(addr, ref)) {
+        if (SD_SendCmd(CMD18, addr) == 0) {
+            int good = 1;
+            for (int b = 0; b < 2; b++) {
+                if (!SD_RxDataBlock(mb + (UINT)b * 512, 512)) {
+                    good = 0;
+                    break;
+                }
+            }
+            SD_SendCmd(CMD12, 0);
+            if (good) {
+                ok = 1;
+                for (int i = 0; i < 512; i++) {
+                    if (ref[i] != mb[i]) {
+                        ok = 0;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    read_deselect();
+    SD_ReadyWait();
+    return ok;
+}
+
 /*--------------------------------------------------------------------------
 
    Public FatFs Functions (wrapped in user_diskio.c)
@@ -270,6 +348,7 @@ DSTATUS USER_SPI_initialize(
     /* no disk */
     if (Stat & STA_NODISK)
         return Stat;
+    sd_multiblock = -1;
     /* Use slow clock before any SD traffic (required by spec; some cards fail at high speed) */
     FCLK_SLOW();
     /* power on */
@@ -350,6 +429,7 @@ DSTATUS USER_SPI_initialize(
     if (type)
     {
         FCLK_FAST();
+        sd_multiblock = probe_multiblock() ? 1 : 0;
         Stat &= ~STA_NOINIT;
     }
     else
@@ -397,36 +477,70 @@ DRESULT USER_SPI_read(
     if (!(CardType & CT_BLOCK))
         sector *= 512;
 
-    SELECT();
-
-    if (count == 1)
+    if (count == 1 || sd_multiblock == 0)
     {
-        /* READ_SINGLE_BLOCK */
-        if ((SD_SendCmd(CMD17, sector) == 0) && SD_RxDataBlock(buff, 512))
-            count = 0;
+        SELECT();
+        if (!read_sectors_cmd17(&sector, &buff, &count)) {
+            read_deselect();
+            return RES_ERROR;
+        }
+        read_deselect();
+        return RES_OK;
     }
-    else
-    {
-        /* READ_MULTIPLE_BLOCK */
-        if (SD_SendCmd(CMD18, sector) == 0)
-        {
-            do
-            {
-                if (!SD_RxDataBlock(buff, 512))
-                    break;
-                buff += 512;
-            } while (--count);
 
-            /* STOP_TRANSMISSION */
-            SD_SendCmd(CMD12, 0);
+    /* CMD18 multi-block (probed OK at init). ACMD23 pre-count mirrors write path. */
+    SELECT();
+    if (CardType & CT_SDC) {
+        SD_SendCmd(CMD55, 0);
+        SD_SendCmd(CMD23, count);
+    }
+    if (SD_SendCmd(CMD18, sector) != 0)
+    {
+        /* Card rejected CMD18 — full CMD17 fallback */
+        read_deselect();
+        SD_ReadyWait();
+        SELECT();
+        if (!read_sectors_cmd17(&sector, &buff, &count)) {
+            read_deselect();
+            return RES_ERROR;
+        }
+        read_deselect();
+        return RES_OK;
+    }
+
+    {
+        DWORD addr = sector;
+        BYTE *ptr  = buff;
+        UINT left  = count;
+        while (left) {
+            if (!SD_RxDataBlock(ptr, 512))
+                break;
+            ptr += 512;
+            if (!(CardType & CT_BLOCK))
+                addr += 512;
+            else
+                addr++;
+            left--;
+        }
+        SD_SendCmd(CMD12, 0);
+        read_deselect();
+        SD_ReadyWait();
+
+        if (left) {
+            /* Partial CMD18 stream — finish remainder via CMD17 */
+            count = left;
+            sector = addr;
+            buff = ptr;
+            SELECT();
+            if (!read_sectors_cmd17(&sector, &buff, &count)) {
+                read_deselect();
+                return RES_ERROR;
+            }
+            read_deselect();
+            return RES_OK;
         }
     }
-
-    /* Idle */
-    DESELECT();
-    SPI_RxByte();
-
-    return count ? RES_ERROR : RES_OK;
+    return RES_OK;
 }
 
 /*-----------------------------------------------------------------------*/
