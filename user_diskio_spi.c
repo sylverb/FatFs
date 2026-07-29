@@ -38,6 +38,8 @@ static uint8_t CardType;                   /* Type 0:MMC, 1:SDC, 2:Block address
 static uint8_t PowerFlag = 0;              /* Power flag */
 /* CMD18 capability probed once at init: -1=unprobed, 0=single-block only, 1=OK */
 static int sd_multiblock = -1;
+/* Runtime: data CRC-16 + card-side CRC after successful CMD59(1). */
+static uint8_t sd_crc_enabled = 0;
 
 #define FCLK_SLOW()                                                       \
     {                                                                     \
@@ -185,16 +187,14 @@ static bool SD_RxDataBlock(BYTE *buff, UINT len)
 
     SPI_RxBuffer(buff, len);
 
-#if SD_SPI_CHECK_DATA_CRC
-    {
+    if (sd_crc_enabled) {
         uint16_t expected = (uint16_t)((SPI_RxByte() << 8) | SPI_RxByte());
         if (expected != sd_crc16(buff, len))
             return false;
+    } else {
+        SPI_RxByte(); /* discard CRC MSB */
+        SPI_RxByte(); /* discard CRC LSB */
     }
-#else
-    SPI_RxByte(); /* discard CRC MSB */
-    SPI_RxByte(); /* discard CRC LSB */
-#endif
 
     return true;
 }
@@ -213,16 +213,14 @@ static bool SD_TxDataBlock(const uint8_t *buff, BYTE token)
     if (token != 0xFD)
     {
         SPI_TxBuffer((uint8_t *)buff, 512);
-#if SD_SPI_CHECK_DATA_CRC
-        {
+        if (sd_crc_enabled) {
             uint16_t crc = sd_crc16(buff, 512);
             SPI_TxByte((uint8_t)(crc >> 8));
             SPI_TxByte((uint8_t)crc);
+        } else {
+            SPI_RxByte(); /* dummy CRC MSB */
+            SPI_RxByte(); /* dummy CRC LSB */
         }
-#else
-        SPI_RxByte(); /* dummy CRC MSB */
-        SPI_RxByte(); /* dummy CRC LSB */
-#endif
         /* receive response (max 65 bytes) */
         while (i <= 64)
         {
@@ -279,6 +277,15 @@ static void read_deselect(void)
     SPI_RxByte();
 }
 
+/* Drop card-side + host data CRC for the rest of the session (cheap-card fallback). */
+static void sd_disable_data_crc(void)
+{
+    if (!sd_crc_enabled)
+        return;
+    SD_SendCmd(CMD59, 0);
+    sd_crc_enabled = 0;
+}
+
 /* One sector via CMD17; addr is byte- or block-address per CardType. */
 static bool read_sector_cmd17(DWORD addr, BYTE *buff)
 {
@@ -290,6 +297,16 @@ static bool read_sector_cmd17(DWORD addr, BYTE *buff)
         SPI_RxByte();
         SELECT();
         SD_ReadyWait();
+    }
+    /* Card accepted CMD59 but data CRC is unreliable — disable and retry once. */
+    if (sd_crc_enabled) {
+        sd_disable_data_crc();
+        DESELECT();
+        SPI_RxByte();
+        SELECT();
+        SD_ReadyWait();
+        if ((SD_SendCmd(CMD17, addr) == 0) && SD_RxDataBlock(buff, 512))
+            return true;
     }
     return false;
 }
@@ -304,6 +321,15 @@ static bool write_sector_cmd24(DWORD addr, const BYTE *buff)
         SPI_RxByte();
         SELECT();
         SD_ReadyWait();
+    }
+    if (sd_crc_enabled) {
+        sd_disable_data_crc();
+        DESELECT();
+        SPI_RxByte();
+        SELECT();
+        SD_ReadyWait();
+        if ((SD_SendCmd(CMD24, addr) == 0) && SD_TxDataBlock(buff, 0xFE))
+            return true;
     }
     return false;
 }
@@ -382,6 +408,7 @@ DSTATUS USER_SPI_initialize(
     if (Stat & STA_NODISK)
         return Stat;
     sd_multiblock = -1;
+    sd_crc_enabled = 0;
     /* Use slow clock before any SD traffic (required by spec; some cards fail at high speed) */
     FCLK_SLOW();
     /* power on */
@@ -462,16 +489,10 @@ DSTATUS USER_SPI_initialize(
     if (type)
     {
 #if SD_SPI_CHECK_DATA_CRC
-        /* Enable SPI-mode CRC checking so data-block CRC-16 is meaningful. */
+        /* Try CRC on; reject is OK — keep card usable without data CRC. */
         SELECT();
-        if (SD_SendCmd(CMD59, 1) != 0) {
-            DESELECT();
-            SPI_RxByte();
-            type = 0;
-            CardType = 0;
-            SD_PowerOff();
-            return Stat;
-        }
+        if (SD_SendCmd(CMD59, 1) == 0)
+            sd_crc_enabled = 1;
         DESELECT();
         SPI_RxByte();
 #endif
@@ -783,4 +804,9 @@ DRESULT USER_SPI_ioctl(
         SPI_RxByte();
     }
     return res;
+}
+
+uint8_t USER_SPI_crc_enabled(void)
+{
+    return sd_crc_enabled;
 }

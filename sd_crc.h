@@ -7,7 +7,9 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* Set to 0 to skip data CRC verify/send and CMD59 (compat with some cheap cards). */
+/* When 1: try CMD59 + data CRC-16 at runtime. Cheap/old cards that reject CMD59
+ * or return bad data CRCs fall back to CRC-off automatically (init never fails
+ * solely because of CRC). When 0: never enable data CRC. */
 #ifndef SD_SPI_CHECK_DATA_CRC
 #define SD_SPI_CHECK_DATA_CRC 1
 #endif

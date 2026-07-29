@@ -44,6 +44,8 @@ static uint8_t CardType;                   /* Type 0:MMC, 1:SDC, 2:Block address
  * the single-block path — zero regression. */
 static int sd_multiblock = -1;
 static uint8_t PowerFlag = 0;              /* Power flag */
+/* Runtime: data CRC-16 + card-side CRC after successful CMD59(1). */
+static uint8_t sd_crc_enabled = 0;
 
 #ifndef MIN
 #define MIN(a, b) ({__typeof__(a) _a = (a); __typeof__(b) _b = (b);_a < _b ? _a : _b; })
@@ -283,33 +285,32 @@ static void acmd23(UINT count)
 
 static bool finish_read_cmd(const uint8_t *buff, uint32_t len)
 {
-#if SD_SPI_CHECK_DATA_CRC
-    uint8_t crc_bytes[2];
-    uint16_t expected;
+    if (sd_crc_enabled) {
+        uint8_t crc_bytes[2];
+        uint16_t expected;
 
-    SoftSpi_WriteDummyRead(sd.spi, crc_bytes, 2);
-    expected = (uint16_t)((crc_bytes[0] << 8) | crc_bytes[1]);
-    return expected == sd_crc16(buff, len);
-#else
+        SoftSpi_WriteDummyRead(sd.spi, crc_bytes, 2);
+        expected = (uint16_t)((crc_bytes[0] << 8) | crc_bytes[1]);
+        return expected == sd_crc16(buff, len);
+    }
     SoftSpi_WriteDummyRead(sd.spi, NULL, 2);
     (void)buff;
     (void)len;
     return true;
-#endif
 }
 
 static bool finish_write_cmd(const uint8_t *buff, uint32_t len)
 {
     uint8_t rbyte;
-#if SD_SPI_CHECK_DATA_CRC
-    uint16_t crc = sd_crc16(buff, len);
-    uint8_t crc_bytes[2] = {(uint8_t)(crc >> 8), (uint8_t)crc};
-    SoftSpi_WriteRead(sd.spi, crc_bytes, NULL, 2);
-#else
-    SoftSpi_WriteDummyRead(sd.spi, NULL, 2);
-    (void)buff;
-    (void)len;
-#endif
+    if (sd_crc_enabled) {
+        uint16_t crc = sd_crc16(buff, len);
+        uint8_t crc_bytes[2] = {(uint8_t)(crc >> 8), (uint8_t)crc};
+        SoftSpi_WriteRead(sd.spi, crc_bytes, NULL, 2);
+    } else {
+        SoftSpi_WriteDummyRead(sd.spi, NULL, 2);
+        (void)buff;
+        (void)len;
+    }
 
     /* Read status byte */
     do
@@ -403,6 +404,9 @@ DSTATUS USER_SOFTSPI_initialize(
     if (Stat & STA_NODISK)
         return Stat;
 
+    sd_crc_enabled = 0;
+    sd_multiblock = -1;
+
     switch_ospi_gpio(false);
 
     /* power on */
@@ -475,13 +479,9 @@ DSTATUS USER_SOFTSPI_initialize(
     if (CardType)
     {
 #if SD_SPI_CHECK_DATA_CRC
-        /* Enable SPI-mode CRC checking so data-block CRC-16 is meaningful. */
-        if (send_cmd(CRC_ON_OFF, 1).r0 != 0) {
-            CardType = 0;
-            SD_PowerOff();
-            switch_ospi_gpio(true);
-            return STA_NOINIT;
-        }
+        /* Try CRC on; reject is OK — keep card usable without data CRC. */
+        if (send_cmd(CRC_ON_OFF, 1).r0 == 0)
+            sd_crc_enabled = 1;
 #endif
         FCLK_FAST();
         Stat &= ~STA_NOINIT;
@@ -523,6 +523,14 @@ static bool wait_start_token(void)
     return false;
 }
 
+static void sd_disable_data_crc(void)
+{
+    if (!sd_crc_enabled)
+        return;
+    send_cmd(CRC_ON_OFF, 0);
+    sd_crc_enabled = 0;
+}
+
 static bool read_sector_cmd17(DWORD addr, BYTE *buff)
 {
     for (int attempt = 0; attempt < SD_IO_RETRIES; attempt++) {
@@ -532,6 +540,16 @@ static bool read_sector_cmd17(DWORD addr, BYTE *buff)
                 return true;
         }
         SD_ReadyWait();
+    }
+    /* Card accepted CMD59 but data CRC is unreliable — disable and retry once. */
+    if (sd_crc_enabled) {
+        sd_disable_data_crc();
+        SD_ReadyWait();
+        if (send_cmd(READ_SINGLE_BLOCK, addr).r0 == 0 && wait_start_token()) {
+            SoftSpi_WriteDummyRead(sd.spi, buff, BLOCK_SIZE);
+            if (finish_read_cmd(buff, BLOCK_SIZE))
+                return true;
+        }
     }
     return false;
 }
@@ -549,6 +567,17 @@ static bool write_sector_cmd24(DWORD addr, const BYTE *buff)
                 return true;
         }
         SD_ReadyWait();
+    }
+    if (sd_crc_enabled) {
+        sd_disable_data_crc();
+        SD_ReadyWait();
+        if (send_cmd(WRITE_SINGLE_BLOCK, addr).r0 == 0) {
+            SoftSpi_WriteDummyRead(sd.spi, NULL, 1);
+            SoftSpi_WriteRead(sd.spi, &token, NULL, 1);
+            SoftSpi_WriteRead(sd.spi, buff, NULL, BLOCK_SIZE);
+            if (finish_write_cmd(buff, BLOCK_SIZE))
+                return true;
+        }
     }
     return false;
 }
@@ -818,4 +847,9 @@ DRESULT USER_SOFTSPI_ioctl(
         switch_ospi_gpio(true);
     }
     return res;
+}
+
+uint8_t USER_SOFTSPI_crc_enabled(void)
+{
+    return sd_crc_enabled;
 }
