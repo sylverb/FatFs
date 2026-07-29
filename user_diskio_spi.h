@@ -45,6 +45,7 @@ extern SPI_HandleTypeDef  hspi1;
 #define CMD41    (0x40+41)      /* SEND_OP_COND (ACMD) */
 #define CMD55    (0x40+55)      /* APP_CMD */
 #define CMD58    (0x40+58)      /* READ_OCR */
+#define CMD59    (0x40+59)      /* CRC_ON_OFF */
 
 //-----[ MMC Card Types (MMC_GET_TYPE) ]-----
 #define CT_MMC    0x01  /* MMC ver 3 */

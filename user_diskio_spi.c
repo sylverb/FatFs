@@ -28,6 +28,7 @@
 #include "stm32h7xx_hal.h" /* Provide the low-level HAL functions */
 #include "user_diskio_spi.h"
 #include "gw_timer.h"
+#include "sd_crc.h"
 #include <string.h>
 
 #define SD_SPI_HANDLE hspi1
@@ -184,8 +185,16 @@ static bool SD_RxDataBlock(BYTE *buff, UINT len)
 
     SPI_RxBuffer(buff, len);
 
-    SPI_RxByte(); // discard CRC MSB
-    SPI_RxByte(); // discard CRC LSB
+#if SD_SPI_CHECK_DATA_CRC
+    {
+        uint16_t expected = (uint16_t)((SPI_RxByte() << 8) | SPI_RxByte());
+        if (expected != sd_crc16(buff, len))
+            return false;
+    }
+#else
+    SPI_RxByte(); /* discard CRC MSB */
+    SPI_RxByte(); /* discard CRC LSB */
+#endif
 
     return true;
 }
@@ -204,9 +213,16 @@ static bool SD_TxDataBlock(const uint8_t *buff, BYTE token)
     if (token != 0xFD)
     {
         SPI_TxBuffer((uint8_t *)buff, 512);
-        /* discard CRC */
-        SPI_RxByte();
-        SPI_RxByte();
+#if SD_SPI_CHECK_DATA_CRC
+        {
+            uint16_t crc = sd_crc16(buff, 512);
+            SPI_TxByte((uint8_t)(crc >> 8));
+            SPI_TxByte((uint8_t)crc);
+        }
+#else
+        SPI_RxByte(); /* dummy CRC MSB */
+        SPI_RxByte(); /* dummy CRC LSB */
+#endif
         /* receive response (max 65 bytes) */
         while (i <= 64)
         {
@@ -230,24 +246,18 @@ static bool SD_TxDataBlock(const uint8_t *buff, BYTE token)
 /* transmit command */
 static BYTE SD_SendCmd(BYTE cmd, uint32_t arg)
 {
-    uint8_t crc, res;
+    uint8_t frame[5], crc, res;
     /* wait SD ready */
     if (SD_ReadyWait() != 0xFF)
         return 0xFF;
-    /* transmit command */
-    SPI_TxByte(cmd);                  /* Command */
-    SPI_TxByte((uint8_t)(arg >> 24)); /* Argument[31..24] */
-    SPI_TxByte((uint8_t)(arg >> 16)); /* Argument[23..16] */
-    SPI_TxByte((uint8_t)(arg >> 8));  /* Argument[15..8] */
-    SPI_TxByte((uint8_t)arg);         /* Argument[7..0] */
-    /* prepare CRC */
-    if (cmd == CMD0)
-        crc = 0x95; /* CRC for CMD0(0) */
-    else if (cmd == CMD8)
-        crc = 0x87; /* CRC for CMD8(0x1AA) */
-    else
-        crc = 1;
-    /* transmit CRC */
+    frame[0] = cmd;
+    frame[1] = (uint8_t)(arg >> 24);
+    frame[2] = (uint8_t)(arg >> 16);
+    frame[3] = (uint8_t)(arg >> 8);
+    frame[4] = (uint8_t)arg;
+    /* Always compute CRC-7: required for CMD0/CMD8, and for all cmds after CMD59. */
+    crc = sd_crc7(frame, 5);
+    SPI_TxBuffer(frame, sizeof(frame));
     SPI_TxByte(crc);
     /* Skip a stuff byte when STOP_TRANSMISSION */
     if (cmd == CMD12)
@@ -272,7 +282,30 @@ static void read_deselect(void)
 /* One sector via CMD17; addr is byte- or block-address per CardType. */
 static bool read_sector_cmd17(DWORD addr, BYTE *buff)
 {
-    return (SD_SendCmd(CMD17, addr) == 0) && SD_RxDataBlock(buff, 512);
+    for (int attempt = 0; attempt < SD_IO_RETRIES; attempt++) {
+        if ((SD_SendCmd(CMD17, addr) == 0) && SD_RxDataBlock(buff, 512))
+            return true;
+        /* Resync bus between retries (CRC/token errors leave the stream dirty). */
+        DESELECT();
+        SPI_RxByte();
+        SELECT();
+        SD_ReadyWait();
+    }
+    return false;
+}
+
+/* One sector via CMD24. */
+static bool write_sector_cmd24(DWORD addr, const BYTE *buff)
+{
+    for (int attempt = 0; attempt < SD_IO_RETRIES; attempt++) {
+        if ((SD_SendCmd(CMD24, addr) == 0) && SD_TxDataBlock(buff, 0xFE))
+            return true;
+        DESELECT();
+        SPI_RxByte();
+        SELECT();
+        SD_ReadyWait();
+    }
+    return false;
 }
 
 /* CMD17 loop: advance addr/buff pointers, decrement count. Caller holds SELECT. */
@@ -428,6 +461,20 @@ DSTATUS USER_SPI_initialize(
     /* Clear STA_NOINIT */
     if (type)
     {
+#if SD_SPI_CHECK_DATA_CRC
+        /* Enable SPI-mode CRC checking so data-block CRC-16 is meaningful. */
+        SELECT();
+        if (SD_SendCmd(CMD59, 1) != 0) {
+            DESELECT();
+            SPI_RxByte();
+            type = 0;
+            CardType = 0;
+            SD_PowerOff();
+            return Stat;
+        }
+        DESELECT();
+        SPI_RxByte();
+#endif
         FCLK_FAST();
         sd_multiblock = probe_multiblock() ? 1 : 0;
         Stat &= ~STA_NOINIT;
@@ -574,13 +621,13 @@ DRESULT USER_SPI_write(
 
     if (count == 1)
     {
-        /* WRITE_BLOCK */
-        if ((SD_SendCmd(CMD24, sector) == 0) && SD_TxDataBlock(buff, 0xFE))
+        /* WRITE_BLOCK with retries */
+        if (write_sector_cmd24(sector, buff))
             count = 0;
     }
     else
     {
-        /* WRITE_MULTIPLE_BLOCK */
+        /* WRITE_MULTIPLE_BLOCK; on mid-stream failure finish remainder via CMD24 retries. */
         if (CardType & CT_SDC)
         {
             SD_SendCmd(CMD55, 0);
@@ -594,10 +641,25 @@ DRESULT USER_SPI_write(
                 if (!SD_TxDataBlock(buff, 0xFC))
                     break;
                 buff += 512;
+                if (!(CardType & CT_BLOCK))
+                    sector += 512;
+                else
+                    sector++;
             } while (--count);
 
             /* STOP_TRAN token */
             SD_TxDataBlock(0, 0xFD);
+        }
+
+        while (count) {
+            if (!write_sector_cmd24(sector, buff))
+                break;
+            buff += 512;
+            if (!(CardType & CT_BLOCK))
+                sector += 512;
+            else
+                sector++;
+            count--;
         }
     }
 
