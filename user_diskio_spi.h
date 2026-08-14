@@ -64,4 +64,7 @@ extern DRESULT USER_SPI_write (BYTE pdrv, const BYTE *buff, DWORD sector, UINT c
 extern DRESULT USER_SPI_ioctl (BYTE pdrv, BYTE cmd, void *buff);
 extern uint8_t USER_SPI_crc_enabled(void);
 
+/* Forget DMA bounce buffers after ram_init() (retro-go). No-op-safe if unused. */
+void sd_io_on_ram_init(void);
+
 #endif
