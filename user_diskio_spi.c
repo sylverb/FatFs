@@ -28,9 +28,13 @@
 #include "stm32h7xx_hal.h" /* Provide the low-level HAL functions */
 #include "user_diskio_spi.h"
 #include "gw_timer.h"
+#include "gw_sdcard.h"
+#include "gw_malloc.h"
 #include <string.h>
 
 #define SD_SPI_HANDLE hspi1
+#define SPI_DMA_MIN_LEN 32
+#define SPI_DMA_BLOCK 512
 
 static volatile DSTATUS Stat = STA_NOINIT; /* Disk Status */
 static uint8_t CardType;                   /* Type 0:MMC, 1:SDC, 2:Block addressing */
@@ -38,18 +42,34 @@ static uint8_t PowerFlag = 0;              /* Power flag */
 /* CMD18 capability probed once at init: -1=unprobed, 0=single-block only, 1=OK */
 static int sd_multiblock = -1;
 
-#define FCLK_SLOW()                                                       \
-    {                                                                     \
-        HAL_SPI_DeInit(&SD_SPI_HANDLE);                                   \
-        SD_SPI_HANDLE.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_128; \
-        HAL_SPI_Init(&SD_SPI_HANDLE);                                     \
-    } /* Set SCLK = slow */
-#define FCLK_FAST()                                                     \
-    {                                                                   \
-        HAL_SPI_DeInit(&SD_SPI_HANDLE);                                 \
-        SD_SPI_HANDLE.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_4; \
-        HAL_SPI_Init(&SD_SPI_HANDLE);                                   \
-    } /* Set SCLK = fast */
+/* DMA bounce buffers in RAM_EMU (AXI SRAM), 32-byte aligned. DMA1 cannot
+ * reach DTCM (stack); FatFs win[] is unaligned so we never DMA into it.
+ * Allocated lazily via ram_malloc() — ram_init() forgets them. */
+static uint8_t *s_spi_tx_ff;
+static uint8_t *s_spi_rx;
+static uint8_t s_spi_tx_ff_ready;
+
+void sd_io_on_ram_init(void)
+{
+    s_spi_tx_ff = NULL;
+    s_spi_rx = NULL;
+    s_spi_tx_ff_ready = 0;
+}
+
+/* Change MBR only — HAL_SPI_DeInit/Init tears down GPIO+DMA+SPI1 IRQ and
+ * left IER stale, which made CMD0 polling fail (FR_NOT_READY / no SD). */
+static void spi_set_prescaler(uint32_t presc)
+{
+    SPI_HandleTypeDef *h = HSPI_SDCARD;
+    h->Init.BaudRatePrescaler = presc;
+    CLEAR_BIT(h->Instance->CR1, SPI_CR1_SPE);
+    while ((h->Instance->CR1 & SPI_CR1_SPE) != 0U)
+        ;
+    MODIFY_REG(h->Instance->CFG1, SPI_CFG1_MBR, presc);
+}
+
+#define FCLK_SLOW() spi_set_prescaler(SPI_BAUDRATEPRESCALER_128)
+#define FCLK_FAST() spi_set_prescaler(SPI_BAUDRATEPRESCALER_4)
 
 //-----[ SPI Functions ]-----
 
@@ -81,15 +101,101 @@ static void SPI_TxBuffer(const uint8_t *buffer, uint16_t len)
     HAL_SPI_Transmit(HSPI_SDCARD, (uint8_t *)buffer, len, SPI_TIMEOUT);
 }
 
-/* SPI receive buffer (bulk). SD data blocks are always 512 bytes; reading
-   byte-by-byte via SPI_RxByte() was ~10x slower than necessary. */
+/* Round addr/len to 32-byte cache lines for CMSIS by_Addr helpers. */
+static void dcache_clean_range(const void *addr, uint32_t len)
+{
+    uint32_t a = (uint32_t)addr & ~31u;
+    uint32_t e = ((uint32_t)addr + len + 31u) & ~31u;
+    SCB_CleanDCache_by_Addr((uint32_t *)a, (int32_t)(e - a));
+}
+
+static void dcache_invalidate_range(void *addr, uint32_t len)
+{
+    uint32_t a = (uint32_t)addr & ~31u;
+    uint32_t e = ((uint32_t)addr + len + 31u) & ~31u;
+    SCB_InvalidateDCache_by_Addr((uint32_t *)a, (int32_t)(e - a));
+}
+
+static int spi_dma_ensure_bufs(void)
+{
+    uint8_t *raw;
+    uintptr_t base;
+
+    if (s_spi_tx_ff && s_spi_rx)
+        return 1;
+    /* Core load / launcher after emulator_start() may have ram_start == 0. */
+    if (ram_start == 0)
+        return 0;
+    /* +31 so we can 32-byte-align for D-cache by_Addr. */
+    raw = ram_malloc(SPI_DMA_BLOCK * 2 + 31);
+    if (!raw)
+        return 0;
+    base = ((uintptr_t)raw + 31u) & ~31u;
+    s_spi_tx_ff = (uint8_t *)base;
+    s_spi_rx = s_spi_tx_ff + SPI_DMA_BLOCK;
+    s_spi_tx_ff_ready = 0;
+    return 1;
+}
+
+static void spi_ensure_tx_ff(void)
+{
+    if (!s_spi_tx_ff_ready && s_spi_tx_ff) {
+        memset(s_spi_tx_ff, 0xFF, SPI_DMA_BLOCK);
+        dcache_clean_range(s_spi_tx_ff, SPI_DMA_BLOCK);
+        s_spi_tx_ff_ready = 1;
+    }
+}
+
+/* SPI receive buffer (bulk). SD data blocks are always 512 bytes. Use SPI1 DMA
+ * so the CPU can keep feeding PCM (sd_io_poll) during the transfer — polling
+ * HAL_SPI_TransmitReceive starved the video player's ring.
+ *
+ * Always DMA into s_spi_rx (RAM_EMU). probe_multiblock() and some FatFs
+ * paths pass DTCM stack buffers; DMA1 cannot access DTCM on H7. */
 static void SPI_RxBuffer(uint8_t *buffer, uint16_t len)
 {
-    uint8_t tx_ff[512];
-    memset(tx_ff, 0xFF, len);
-    while (!__HAL_SPI_GET_FLAG(HSPI_SDCARD, SPI_FLAG_TXE))
-        ;
-    HAL_SPI_TransmitReceive(HSPI_SDCARD, tx_ff, buffer, len, SPI_TIMEOUT);
+    if (len == 0)
+        return;
+    if (len > SPI_DMA_BLOCK)
+        len = SPI_DMA_BLOCK;
+
+    if (!spi_dma_ensure_bufs())
+        goto polling;
+    spi_ensure_tx_ff();
+
+    if (len < SPI_DMA_MIN_LEN || (HSPI_SDCARD)->hdmatx == NULL || (HSPI_SDCARD)->hdmarx == NULL)
+        goto polling;
+
+    dcache_clean_range(s_spi_tx_ff, len);
+    dcache_invalidate_range(s_spi_rx, len);
+
+    if (HAL_SPI_TransmitReceive_DMA(HSPI_SDCARD, s_spi_tx_ff, s_spi_rx, len) != HAL_OK)
+        goto polling;
+
+    gw_timer_on(0, SPI_TIMEOUT);
+    while (HAL_SPI_GetState(HSPI_SDCARD) != HAL_SPI_STATE_READY) {
+        sd_io_poll();
+        if (!gw_timer_status(0)) {
+            (void)HAL_SPI_Abort(HSPI_SDCARD);
+            goto polling;
+        }
+    }
+    dcache_invalidate_range(s_spi_rx, len);
+    memcpy(buffer, s_spi_rx, len);
+    return;
+
+polling:
+    {
+        uint8_t tx_stack[SPI_DMA_BLOCK];
+        uint8_t *tx = s_spi_tx_ff;
+        if (!tx) {
+            memset(tx_stack, 0xFF, len);
+            tx = tx_stack;
+        }
+        while (!__HAL_SPI_GET_FLAG(HSPI_SDCARD, SPI_FLAG_TXE))
+            ;
+        HAL_SPI_TransmitReceive(HSPI_SDCARD, tx, buffer, len, SPI_TIMEOUT);
+    }
 }
 
 /* SPI receive a byte */
