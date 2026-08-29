@@ -40,19 +40,18 @@ static uint8_t PowerFlag = 0;              /* Power flag */
 static int sd_multiblock = -1;
 /* Runtime: data CRC-16 + card-side CRC after successful CMD59(1). */
 static uint8_t sd_crc_enabled = 0;
+/* Fast SPI baud after init: try /2 (32 MHz), fall back to /4 (16 MHz). */
+static uint32_t sd_spi_fast_baud = SPI_BAUDRATEPRESCALER_2;
 
-#define FCLK_SLOW()                                                       \
-    {                                                                     \
-        HAL_SPI_DeInit(&SD_SPI_HANDLE);                                   \
-        SD_SPI_HANDLE.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_128; \
-        HAL_SPI_Init(&SD_SPI_HANDLE);                                     \
-    } /* Set SCLK = slow */
-#define FCLK_FAST()                                                     \
-    {                                                                   \
-        HAL_SPI_DeInit(&SD_SPI_HANDLE);                                 \
-        SD_SPI_HANDLE.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_4; \
-        HAL_SPI_Init(&SD_SPI_HANDLE);                                   \
-    } /* Set SCLK = fast */
+static void fclk_set(uint32_t baud)
+{
+    HAL_SPI_DeInit(&SD_SPI_HANDLE);
+    SD_SPI_HANDLE.Init.BaudRatePrescaler = baud;
+    HAL_SPI_Init(&SD_SPI_HANDLE);
+}
+
+#define FCLK_SLOW() fclk_set(SPI_BAUDRATEPRESCALER_128)
+#define FCLK_FAST() fclk_set(sd_spi_fast_baud)
 
 //-----[ SPI Functions ]-----
 
@@ -68,41 +67,101 @@ static void DESELECT(void)
     HAL_GPIO_WritePin(SD_CS_GPIO_Port, SD_CS_Pin, GPIO_PIN_SET);
 }
 
+/* Register-level full-duplex transfer, bypassing HAL_SPI_Transmit/
+ * TransmitReceive: those re-validate parameters, take/release hspi->Lock and
+ * recompute FIFO sizing on every single-byte call, which dominates the cost
+ * of SD command/response bytes (the 512-byte data phase is a smaller share
+ * of total overhead). SD SPI is always 8-bit master full-duplex here, so we
+ * drive CR1/CR2/TXDR/RXDR directly, following the same sequence HAL uses
+ * internally (TSIZE while SPE=0 -> SPE=1 -> CSTART -> pump FIFO -> wait EOT
+ * -> clear EOT/TXTF -> SPE=0) without the generic-path overhead.
+ * tx==NULL sends 0xFF filler (reads); rx==NULL discards received bytes
+ * (writes) — this also avoids the 512-byte 0xFF stack buffer the old
+ * HAL_SPI_TransmitReceive()-based SPI_RxBuffer() needed. */
+static void spi_xfer(const uint8_t *tx, uint8_t *rx, uint16_t len)
+{
+    SPI_TypeDef *spi = SD_SPI_HANDLE.Instance;
+    __IO uint8_t *txdr = (__IO uint8_t *)&spi->TXDR;
+    __IO uint8_t *rxdr = (__IO uint8_t *)&spi->RXDR;
+    uint16_t tx_left = len, rx_left = len;
+    uint32_t tickstart = HAL_GetTick();
+
+    MODIFY_REG(spi->CR2, SPI_CR2_TSIZE, len);
+    SET_BIT(spi->CR1, SPI_CR1_SPE);
+    SET_BIT(spi->CR1, SPI_CR1_CSTART);
+
+    while (tx_left || rx_left)
+    {
+        uint32_t sr = spi->SR;
+
+        if (tx_left && (sr & SPI_SR_TXP))
+        {
+            *txdr = tx ? *tx++ : 0xFF;
+            tx_left--;
+        }
+
+        if (rx_left)
+        {
+            if (sr & SPI_SR_RXP)
+            {
+                uint8_t b = *rxdr;
+                if (rx)
+                    *rx++ = b;
+                rx_left--;
+            }
+            /* Near the end of a transfer (< 4 bytes left) the H7 SPI can
+             * leave the last byte(s) sitting in the RX FIFO at a partial
+             * packing level without ever asserting RXP; RXPLVL is how
+             * HAL_SPI_TransmitReceive()'s own 8-bit path detects that tail
+             * data. Without this fallback the loop below can wait forever
+             * for an RXP that never comes. */
+            else if ((rx_left < 4) && (sr & SPI_SR_RXPLVL))
+            {
+                uint8_t b = *rxdr;
+                if (rx)
+                    *rx++ = b;
+                rx_left--;
+            }
+        }
+
+        if ((HAL_GetTick() - tickstart) >= SPI_TIMEOUT)
+            break; /* hardware not responding: bail out instead of hanging */
+    }
+
+    /* Same timeout budget as the HAL path; EOT is expected to assert
+     * promptly once every byte has been clocked out/in above. */
+    while (!(spi->SR & SPI_SR_EOT))
+    {
+        if ((HAL_GetTick() - tickstart) >= SPI_TIMEOUT)
+            break;
+    }
+    SET_BIT(spi->IFCR, SPI_IFCR_EOTC | SPI_IFCR_TXTFC);
+    CLEAR_BIT(spi->CR1, SPI_CR1_SPE);
+}
+
 /* SPI transmit a byte */
 static void SPI_TxByte(uint8_t data)
 {
-    while (!__HAL_SPI_GET_FLAG(HSPI_SDCARD, SPI_FLAG_TXE))
-        ;
-    HAL_SPI_Transmit(HSPI_SDCARD, &data, 1, SPI_TIMEOUT);
+    spi_xfer(&data, NULL, 1);
 }
 
 /* SPI transmit buffer */
 static void SPI_TxBuffer(const uint8_t *buffer, uint16_t len)
 {
-    while (!__HAL_SPI_GET_FLAG(HSPI_SDCARD, SPI_FLAG_TXE))
-        ;
-    HAL_SPI_Transmit(HSPI_SDCARD, (uint8_t *)buffer, len, SPI_TIMEOUT);
+    spi_xfer(buffer, NULL, len);
 }
 
-/* SPI receive buffer (bulk). SD data blocks are always 512 bytes; reading
-   byte-by-byte via SPI_RxByte() was ~10x slower than necessary. */
+/* SPI receive buffer (bulk). SD data blocks are always 512 bytes. */
 static void SPI_RxBuffer(uint8_t *buffer, uint16_t len)
 {
-    uint8_t tx_ff[512];
-    memset(tx_ff, 0xFF, len);
-    while (!__HAL_SPI_GET_FLAG(HSPI_SDCARD, SPI_FLAG_TXE))
-        ;
-    HAL_SPI_TransmitReceive(HSPI_SDCARD, tx_ff, buffer, len, SPI_TIMEOUT);
+    spi_xfer(NULL, buffer, len);
 }
 
 /* SPI receive a byte */
 static uint8_t SPI_RxByte(void)
 {
-    uint8_t dummy, data;
-    dummy = 0xFF;
-    while (!__HAL_SPI_GET_FLAG(HSPI_SDCARD, SPI_FLAG_TXE))
-        ;
-    HAL_SPI_TransmitReceive(HSPI_SDCARD, &dummy, &data, 1, SPI_TIMEOUT);
+    uint8_t data;
+    spi_xfer(NULL, &data, 1);
     return data;
 }
 
@@ -386,6 +445,38 @@ static int probe_multiblock(void)
     return ok;
 }
 
+/* Two identical CMD17 reads of sector 0 — catches cards that cannot sustain
+ * the current SPI clock (garbage / CRC / no token). */
+static int probe_spi_speed(void)
+{
+    uint8_t a[512], b[512];
+
+    SELECT();
+    if (!read_sector_cmd17(0, a)) {
+        read_deselect();
+        return 0;
+    }
+    if (!read_sector_cmd17(0, b)) {
+        read_deselect();
+        return 0;
+    }
+    read_deselect();
+    return memcmp(a, b, 512) == 0;
+}
+
+/* Prefer 32 MHz (/2); if sector reads fail, drop to 16 MHz (/4). */
+static void fclk_fast_with_fallback(void)
+{
+    sd_spi_fast_baud = SPI_BAUDRATEPRESCALER_2;
+    FCLK_FAST();
+    if (probe_spi_speed())
+        return;
+
+    sd_spi_fast_baud = SPI_BAUDRATEPRESCALER_4;
+    FCLK_FAST();
+    (void)probe_spi_speed();
+}
+
 /*--------------------------------------------------------------------------
 
    Public FatFs Functions (wrapped in user_diskio.c)
@@ -496,7 +587,7 @@ DSTATUS USER_SPI_initialize(
         DESELECT();
         SPI_RxByte();
 #endif
-        FCLK_FAST();
+        fclk_fast_with_fallback();
         sd_multiblock = probe_multiblock() ? 1 : 0;
         Stat &= ~STA_NOINIT;
     }
