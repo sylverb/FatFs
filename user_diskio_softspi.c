@@ -252,7 +252,16 @@ static struct sd_cmd
 static void __send_cmd_payload(uint8_t cmd, uint32_t arg)
 {
     uint8_t spi_cmd_payload[6] = {cmd | 0x40, arg >> 24, arg >> 16, arg >> 8, arg, 0};
+#if SD_SPI_CHECK_DATA_CRC
     spi_cmd_payload[5] = sd_crc7(spi_cmd_payload, 5);
+#else
+    if (cmd == CMD0)
+        spi_cmd_payload[5] = 0x95; /* CRC for CMD0(0) */
+    else if (cmd == CMD8)
+        spi_cmd_payload[5] = 0x87; /* CRC for CMD8(0x1AA) */
+    else
+        spi_cmd_payload[5] = 1;
+#endif
     SoftSpi_WriteDummyRead(sd.spi, NULL, 2);
     SoftSpi_WriteRead(sd.spi, spi_cmd_payload, NULL, sizeof(spi_cmd_payload));
     wdog_refresh();

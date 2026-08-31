@@ -441,8 +441,17 @@ static BYTE SD_SendCmd(BYTE cmd, uint32_t arg)
     frame[2] = (uint8_t)(arg >> 16);
     frame[3] = (uint8_t)(arg >> 8);
     frame[4] = (uint8_t)arg;
+#if SD_SPI_CHECK_DATA_CRC
     /* Always compute CRC-7: required for CMD0/CMD8, and for all cmds after CMD59. */
     crc = sd_crc7(frame, 5);
+#else
+    if (cmd == CMD0)
+        crc = 0x95; /* CRC for CMD0(0) */
+    else if (cmd == CMD8)
+        crc = 0x87; /* CRC for CMD8(0x1AA) */
+    else
+        crc = 1;
+#endif
     SPI_TxBuffer(frame, sizeof(frame));
     SPI_TxByte(crc);
     /* Skip a stuff byte when STOP_TRANSMISSION */
