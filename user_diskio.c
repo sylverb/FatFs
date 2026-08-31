@@ -236,6 +236,7 @@ DWORD get_fattime (void)
 /* 1 if active driver enabled data CRC (CMD59 accepted); 0 otherwise. */
 BYTE disk_sd_crc_enabled(void)
 {
+#if SD_SPI_CHECK_DATA_CRC
   switch (sdcard_hw_type)
   {
     case SDCARD_HW_SPI1:
@@ -247,6 +248,9 @@ BYTE disk_sd_crc_enabled(void)
     default:
       return 0;
   }
+#else
+  return 0;
+#endif
 }
 
 /************************ (C) COPYRIGHT STMicroelectronics *****END OF FILE****/

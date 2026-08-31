@@ -62,6 +62,8 @@ extern DSTATUS USER_SOFTSPI_status (BYTE pdrv);
 extern DRESULT USER_SOFTSPI_read (BYTE pdrv, BYTE *buff, DWORD sector, UINT count);
 extern DRESULT USER_SOFTSPI_write (BYTE pdrv, const BYTE *buff, DWORD sector, UINT count);
 extern DRESULT USER_SOFTSPI_ioctl (BYTE pdrv, BYTE cmd, void *buff);
+#if SD_SPI_CHECK_DATA_CRC
 extern uint8_t USER_SOFTSPI_crc_enabled(void);
+#endif
 
 #endif

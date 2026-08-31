@@ -44,8 +44,10 @@ static uint8_t CardType;                   /* Type 0:MMC, 1:SDC, 2:Block address
  * the single-block path — zero regression. */
 static int sd_multiblock = -1;
 static uint8_t PowerFlag = 0;              /* Power flag */
+#if SD_SPI_CHECK_DATA_CRC
 /* Runtime: data CRC-16 + card-side CRC after successful CMD59(1). */
 static uint8_t sd_crc_enabled = 0;
+#endif
 
 #ifndef MIN
 #define MIN(a, b) ({__typeof__(a) _a = (a); __typeof__(b) _b = (b);_a < _b ? _a : _b; })
@@ -285,6 +287,7 @@ static void acmd23(UINT count)
 
 static bool finish_read_cmd(const uint8_t *buff, uint32_t len)
 {
+#if SD_SPI_CHECK_DATA_CRC
     if (sd_crc_enabled) {
         uint8_t crc_bytes[2];
         uint16_t expected;
@@ -293,6 +296,7 @@ static bool finish_read_cmd(const uint8_t *buff, uint32_t len)
         expected = (uint16_t)((crc_bytes[0] << 8) | crc_bytes[1]);
         return expected == sd_crc16(buff, len);
     }
+#endif
     SoftSpi_WriteDummyRead(sd.spi, NULL, 2);
     (void)buff;
     (void)len;
@@ -302,11 +306,15 @@ static bool finish_read_cmd(const uint8_t *buff, uint32_t len)
 static bool finish_write_cmd(const uint8_t *buff, uint32_t len)
 {
     uint8_t rbyte;
+#if SD_SPI_CHECK_DATA_CRC
     if (sd_crc_enabled) {
         uint16_t crc = sd_crc16(buff, len);
         uint8_t crc_bytes[2] = {(uint8_t)(crc >> 8), (uint8_t)crc};
         SoftSpi_WriteRead(sd.spi, crc_bytes, NULL, 2);
-    } else {
+    }
+    else
+#endif
+    {
         SoftSpi_WriteDummyRead(sd.spi, NULL, 2);
         (void)buff;
         (void)len;
@@ -404,7 +412,9 @@ DSTATUS USER_SOFTSPI_initialize(
     if (Stat & STA_NODISK)
         return Stat;
 
+#if SD_SPI_CHECK_DATA_CRC
     sd_crc_enabled = 0;
+#endif
     sd_multiblock = -1;
 
     switch_ospi_gpio(false);
@@ -523,6 +533,7 @@ static bool wait_start_token(void)
     return false;
 }
 
+#if SD_SPI_CHECK_DATA_CRC
 static void sd_disable_data_crc(void)
 {
     if (!sd_crc_enabled)
@@ -530,6 +541,7 @@ static void sd_disable_data_crc(void)
     send_cmd(CRC_ON_OFF, 0);
     sd_crc_enabled = 0;
 }
+#endif
 
 static bool read_sector_cmd17(DWORD addr, BYTE *buff)
 {
@@ -541,6 +553,7 @@ static bool read_sector_cmd17(DWORD addr, BYTE *buff)
         }
         SD_ReadyWait();
     }
+#if SD_SPI_CHECK_DATA_CRC
     /* Card accepted CMD59 but data CRC is unreliable — disable and retry once. */
     if (sd_crc_enabled) {
         sd_disable_data_crc();
@@ -551,6 +564,7 @@ static bool read_sector_cmd17(DWORD addr, BYTE *buff)
                 return true;
         }
     }
+#endif
     return false;
 }
 
@@ -568,6 +582,7 @@ static bool write_sector_cmd24(DWORD addr, const BYTE *buff)
         }
         SD_ReadyWait();
     }
+#if SD_SPI_CHECK_DATA_CRC
     if (sd_crc_enabled) {
         sd_disable_data_crc();
         SD_ReadyWait();
@@ -579,6 +594,7 @@ static bool write_sector_cmd24(DWORD addr, const BYTE *buff)
                 return true;
         }
     }
+#endif
     return false;
 }
 
@@ -849,7 +865,9 @@ DRESULT USER_SOFTSPI_ioctl(
     return res;
 }
 
+#if SD_SPI_CHECK_DATA_CRC
 uint8_t USER_SOFTSPI_crc_enabled(void)
 {
     return sd_crc_enabled;
 }
+#endif

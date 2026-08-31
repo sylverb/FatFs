@@ -62,7 +62,9 @@ extern DSTATUS USER_SPI_status (BYTE pdrv);
 extern DRESULT USER_SPI_read (BYTE pdrv, BYTE *buff, DWORD sector, UINT count);
 extern DRESULT USER_SPI_write (BYTE pdrv, const BYTE *buff, DWORD sector, UINT count);
 extern DRESULT USER_SPI_ioctl (BYTE pdrv, BYTE cmd, void *buff);
+#if SD_SPI_CHECK_DATA_CRC
 extern uint8_t USER_SPI_crc_enabled(void);
+#endif
 
 /* Forget DMA bounce buffers after ram_init() (retro-go). No-op-safe if unused. */
 void sd_io_on_ram_init(void);

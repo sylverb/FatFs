@@ -1,3 +1,4 @@
+#if SD_SPI_CHECK_DATA_CRC
 #include "sd_crc.h"
 
 /* CRC-16/CCITT table, poly 0x1021, init 0 (SD physical layer data CRC). */
@@ -60,3 +61,4 @@ uint16_t sd_crc16(const uint8_t *data, size_t len)
         crc = (uint16_t)((crc << 8) ^ sd_crc16_table[((crc >> 8) ^ *data++) & 0xFF]);
     return crc;
 }
+#endif

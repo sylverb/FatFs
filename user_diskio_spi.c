@@ -47,8 +47,11 @@ static uint8_t CardType;                   /* Type 0:MMC, 1:SDC, 2:Block address
 static uint8_t PowerFlag = 0;              /* Power flag */
 /* CMD18 capability probed once at init: -1=unprobed, 0=single-block only, 1=OK */
 static int sd_multiblock = -1;
+
+#if SD_SPI_CHECK_DATA_CRC
 /* Runtime: data CRC-16 + card-side CRC after successful CMD59(1). */
 static uint8_t sd_crc_enabled = 0;
+#endif
 /* Fast SPI baud after init: try /2 (32 MHz), fall back to /4 (16 MHz). */
 static uint32_t sd_spi_fast_baud = SPI_BAUDRATEPRESCALER_2;
 
@@ -364,11 +367,15 @@ static bool SD_RxDataBlock(BYTE *buff, UINT len)
 
     SPI_RxBuffer(buff, len);
 
+#if SD_SPI_CHECK_DATA_CRC
     if (sd_crc_enabled) {
         uint16_t expected = (uint16_t)((SPI_RxByte() << 8) | SPI_RxByte());
         if (expected != sd_crc16(buff, len))
             return false;
-    } else {
+    }
+    else
+#endif
+    {
         SPI_RxByte(); /* discard CRC MSB */
         SPI_RxByte(); /* discard CRC LSB */
     }
@@ -390,11 +397,15 @@ static bool SD_TxDataBlock(const uint8_t *buff, BYTE token)
     if (token != 0xFD)
     {
         SPI_TxBuffer((uint8_t *)buff, 512);
+#if SD_SPI_CHECK_DATA_CRC
         if (sd_crc_enabled) {
             uint16_t crc = sd_crc16(buff, 512);
             SPI_TxByte((uint8_t)(crc >> 8));
             SPI_TxByte((uint8_t)crc);
-        } else {
+        }
+        else
+#endif
+        {
             SPI_RxByte(); /* dummy CRC MSB */
             SPI_RxByte(); /* dummy CRC LSB */
         }
@@ -454,6 +465,7 @@ static void read_deselect(void)
     SPI_RxByte();
 }
 
+#if SD_SPI_CHECK_DATA_CRC
 /* Drop card-side + host data CRC for the rest of the session (cheap-card fallback). */
 static void sd_disable_data_crc(void)
 {
@@ -462,6 +474,7 @@ static void sd_disable_data_crc(void)
     SD_SendCmd(CMD59, 0);
     sd_crc_enabled = 0;
 }
+#endif
 
 /* One sector via CMD17; addr is byte- or block-address per CardType. */
 static bool read_sector_cmd17(DWORD addr, BYTE *buff)
@@ -475,6 +488,7 @@ static bool read_sector_cmd17(DWORD addr, BYTE *buff)
         SELECT();
         SD_ReadyWait();
     }
+#if SD_SPI_CHECK_DATA_CRC
     /* Card accepted CMD59 but data CRC is unreliable — disable and retry once. */
     if (sd_crc_enabled) {
         sd_disable_data_crc();
@@ -485,6 +499,7 @@ static bool read_sector_cmd17(DWORD addr, BYTE *buff)
         if ((SD_SendCmd(CMD17, addr) == 0) && SD_RxDataBlock(buff, 512))
             return true;
     }
+#endif
     return false;
 }
 
@@ -499,6 +514,7 @@ static bool write_sector_cmd24(DWORD addr, const BYTE *buff)
         SELECT();
         SD_ReadyWait();
     }
+#if SD_SPI_CHECK_DATA_CRC
     if (sd_crc_enabled) {
         sd_disable_data_crc();
         DESELECT();
@@ -508,6 +524,7 @@ static bool write_sector_cmd24(DWORD addr, const BYTE *buff)
         if ((SD_SendCmd(CMD24, addr) == 0) && SD_TxDataBlock(buff, 0xFE))
             return true;
     }
+#endif
     return false;
 }
 
@@ -617,7 +634,9 @@ DSTATUS USER_SPI_initialize(
     if (Stat & STA_NODISK)
         return Stat;
     sd_multiblock = -1;
+#if SD_SPI_CHECK_DATA_CRC
     sd_crc_enabled = 0;
+#endif
     /* Use slow clock before any SD traffic (required by spec; some cards fail at high speed) */
     FCLK_SLOW();
     /* power on */
@@ -1015,7 +1034,9 @@ DRESULT USER_SPI_ioctl(
     return res;
 }
 
+#if SD_SPI_CHECK_DATA_CRC
 uint8_t USER_SPI_crc_enabled(void)
 {
     return sd_crc_enabled;
 }
+#endif
