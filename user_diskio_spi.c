@@ -55,9 +55,19 @@ static uint8_t sd_crc_enabled = 0;
 /* Fast SPI baud after init: try /2 (32 MHz), fall back to /4 (16 MHz). */
 static uint32_t sd_spi_fast_baud = SPI_BAUDRATEPRESCALER_2;
 
-/* DMA bounce buffers in RAM_EMU (AXI SRAM), 32-byte aligned. DMA1 cannot
+/* DMA bounce buffers, 32-byte aligned for D-cache by_Addr. DMA1 cannot
  * reach DTCM (stack); FatFs win[] is unaligned so we never DMA into it.
- * Allocated lazily via ram_malloc() when available — ram_init() forgets them. */
+ *
+ * These used to be ram_malloc()ed out of RAM_EMU. That is the one region
+ * a 2.0 core owns outright: the arcade core loads a machine module at a
+ * FIXED address inside RAM_EMU (60+ module binaries are linked for it) and
+ * overwrote these buffers from under the driver mid-transfer -- f_read
+ * returned FR_DISK_ERR 9216 bytes into a 287KB module, because ram_start
+ * for that core lands just below the module window. Any core that claims
+ * RAM_EMU wholesale has the same collision, so the buffers live in AHB
+ * SRAM instead: DMA1 reaches it, no core owns it, and it costs 1KB of a
+ * pool with ~94K free. */
+static uint8_t s_spi_dma_mem[SPI_DMA_BLOCK * 2] __attribute__((aligned(32)));
 static uint8_t *s_spi_tx_ff;
 static uint8_t *s_spi_rx;
 static uint8_t s_spi_tx_ff_ready;
@@ -65,10 +75,11 @@ static uint8_t s_spi_tx_ff_ready;
 /* Optional PCM feeder during DMA waits (retro-go). Bootloader: no-op. */
 __attribute__((weak)) void sd_io_poll(void) {}
 
+/* Kept for the ram_init() call site and the published header: the buffers
+ * are static now, so there is nothing to forget -- only the pre-filled
+ * 0xFF TX block has to be re-established. */
 void sd_io_on_ram_init(void)
 {
-    s_spi_tx_ff = NULL;
-    s_spi_rx = NULL;
     s_spi_tx_ff_ready = 0;
 }
 
@@ -203,22 +214,14 @@ static void dcache_invalidate_range(void *addr, uint32_t len)
 static int spi_dma_ensure_bufs(void)
 {
 #if SD_SPI_HAS_RAM_MALLOC
-    uint8_t *raw;
-    uintptr_t base;
-
-    if (s_spi_tx_ff && s_spi_rx)
-        return 1;
-    /* Core load / launcher after emulator_start() may have ram_start == 0. */
-    if (ram_start == 0)
-        return 0;
-    /* +31 so we can 32-byte-align for D-cache by_Addr. */
-    raw = ram_malloc(SPI_DMA_BLOCK * 2 + 31);
-    if (!raw)
-        return 0;
-    base = ((uintptr_t)raw + 31u) & ~31u;
-    s_spi_tx_ff = (uint8_t *)base;
-    s_spi_rx = s_spi_tx_ff + SPI_DMA_BLOCK;
-    s_spi_tx_ff_ready = 0;
+    /* No allocation and no ram_start dependency any more, so the DMA path
+     * is also available during core load and right after emulator_start(),
+     * where ram_start == 0 used to force the slow byte-banged path. */
+    if (!s_spi_tx_ff) {
+        s_spi_tx_ff = s_spi_dma_mem;
+        s_spi_rx = s_spi_dma_mem + SPI_DMA_BLOCK;
+        s_spi_tx_ff_ready = 0;
+    }
     return 1;
 #else
     (void)s_spi_tx_ff;
@@ -240,7 +243,7 @@ static void spi_ensure_tx_ff(void)
  * buffers are available (retro-go: keeps sd_io_poll feeding PCM). Otherwise
  * fall back to register-level spi_xfer (bootloader / no DMA).
  *
- * Always DMA into s_spi_rx (RAM_EMU). probe_multiblock() and some FatFs
+ * Always DMA into s_spi_rx (AHB SRAM). probe_multiblock() and some FatFs
  * paths pass DTCM stack buffers; DMA1 cannot access DTCM on H7. */
 static void SPI_RxBuffer(uint8_t *buffer, uint16_t len)
 {
