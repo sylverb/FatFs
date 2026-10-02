@@ -35,6 +35,7 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include <string.h>
+#include <stdio.h>
 #include <time.h>
 #include "main.h"
 #include "ff.h"
@@ -47,6 +48,12 @@
 /* Private variables ---------------------------------------------------------*/
 /* Disk status */
 static volatile DSTATUS Stat = STA_NOINIT;
+
+/* After a failed sector read the bus/card may be unreliable. Refuse further
+ * writes until the next successful disk_initialize() so we do not push a
+ * half-updated FAT/dir onto a dying link (ghost files / unreadable volume). */
+static uint8_t s_write_inhibit;
+static uint8_t s_write_inhibit_logged;
 
 /* USER CODE END DECL */
 
@@ -84,18 +91,23 @@ DSTATUS disk_initialize (
 )
 {
   /* USER CODE BEGIN INIT */
+  DSTATUS st = STA_NOINIT;
   switch (sdcard_hw_type)
   {
     case SDCARD_HW_SPI1:
-      return USER_SPI_initialize(pdrv);
+      st = USER_SPI_initialize(pdrv);
       break;
     case SDCARD_HW_OSPI1:
-      return USER_SOFTSPI_initialize(pdrv);
+      st = USER_SOFTSPI_initialize(pdrv);
       break;
     default:
-      return STA_NOINIT;
       break;
   }
+  if ((st & STA_NOINIT) == 0) {
+    s_write_inhibit = 0;
+    s_write_inhibit_logged = 0;
+  }
+  return st;
   /* USER CODE END INIT */
 }
 
@@ -140,18 +152,26 @@ DRESULT disk_read (
 )
 {
   /* USER CODE BEGIN READ */
+  DRESULT res = RES_NOTRDY;
   switch (sdcard_hw_type)
   {
     case SDCARD_HW_SPI1:
-    	return USER_SPI_read(pdrv, buff, sector, count);
+      res = USER_SPI_read(pdrv, buff, sector, count);
       break;
     case SDCARD_HW_OSPI1:
-    	return USER_SOFTSPI_read(pdrv, buff, sector, count);
+      res = USER_SOFTSPI_read(pdrv, buff, sector, count);
       break;
     default:
-      return STA_NOINIT;
       break;
   }
+  if (res != RES_OK) {
+    s_write_inhibit = 1;
+    if (!s_write_inhibit_logged) {
+      s_write_inhibit_logged = 1;
+      printf("SD: read failed — writes inhibited until reinit\n");
+    }
+  }
+  return res;
   /* USER CODE END READ */
 }
 
@@ -171,18 +191,17 @@ DRESULT disk_write (
 )
 {
   /* USER CODE BEGIN WRITE */
-  /* USER CODE HERE */
+  if (s_write_inhibit)
+    return RES_WRPRT;
+
   switch (sdcard_hw_type)
   {
     case SDCARD_HW_SPI1:
-    	return USER_SPI_write(pdrv, buff, sector, count);
-      break;
+      return USER_SPI_write(pdrv, buff, sector, count);
     case SDCARD_HW_OSPI1:
-    	return USER_SOFTSPI_write(pdrv, buff, sector, count);
-      break;
+      return USER_SOFTSPI_write(pdrv, buff, sector, count);
     default:
       return RES_ERROR;
-      break;
   }
   /* USER CODE END WRITE */
 }
